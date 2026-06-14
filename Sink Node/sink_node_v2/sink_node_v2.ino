@@ -81,6 +81,10 @@ void mqttCallback(const char* topic, byte* payload, int length);
 void controlActuator(const char*topic, byte* payload);
 void controlWaterPump(boolean status);
 void controlFan(boolean status);
+void actuatorOffOnThreshold();
+boolean isMoistureThreshold();
+boolean isTemperatureThreshold();
+void ShouldActivateActuator();
 
 void setup() {
   Serial.begin(9600);
@@ -109,6 +113,8 @@ void loop() {
   if (hasNewPacket) {
     parseLoRaPacket(sizeof(payload));
   }
+
+  ShouldActivateActuator();
   
   if(fanState || waterPumpState) {
     if(millis() - lastActuatorMessage >= 1000) {
@@ -125,6 +131,7 @@ void loop() {
       }
       display.setCursor(0, 1);
       display.print((actuatorType + "ON").c_str());
+      actuatorOffOnThreshold();
     }
   } else if(!hasNewPacket) {
     lastDisplayMillis = currentMillis;
@@ -136,10 +143,12 @@ void loop() {
 
   if(waterPumpState && (millis() - lastWaterPumpActivate >= 20000)) {
     controlWaterPump(0);
+    sentStatusActuator("waterpump");
   }
 
   if(fanState && (millis() - lastFanActivate >= 20000)) {
     controlFan(0);
+    sentStatusActuator("fan");
   }
 }
 
@@ -347,6 +356,7 @@ void controlActuator(const char* topic, byte* payload) {
   }else if(currentTopic.indexOf("fan") != -1) {
     controlFan(status);
   }
+  sentStatusActuator(topic);
 }
 
 void controlWaterPump(boolean status) {
@@ -397,5 +407,34 @@ void sentStatusActuator(const char* topic) {
       showMessage(0, 0, "Status sent");
       showMessage(0, 1, (String("State: ") + fanState).c_str());
     }
+  }
+}
+
+void actuatorOffOnThreshold() {
+  if(isMoistureThreshold(moistS)) {
+    controlWaterPump(0);
+  }
+  if(isTemperatureThreshold(tempA)){
+    controlFan(0);
+  }
+}
+
+boolean isMoistureThreshold(float value) {
+  return (value >= 20 && value <= 60);
+}
+
+boolean isTemperatureThreshold(float value) {
+  return value <= 33;
+}
+
+void ShouldActivateActuator(){
+  if(tempA == 0 || moistS == 0 || tempS == 0) {
+    return;
+  }
+  if(tempA > 33) {
+    controlFan(1);
+  }
+  if(moistS <= 20) {
+    controlWaterPump(1);
   }
 }
