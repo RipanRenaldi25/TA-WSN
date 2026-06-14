@@ -410,31 +410,26 @@ void sentStatusActuator(const char* topic) {
   }
 }
 
-void actuatorOffOnThreshold() {
-  if(isMoistureThreshold(moistS)) {
-    controlWaterPump(0);
-  }
-  if(isTemperatureThreshold(tempA)){
-    controlFan(0);
-  }
-}
-
-boolean isMoistureThreshold(float value) {
-  return (value >= 20 && value <= 60);
-}
-
-boolean isTemperatureThreshold(float value) {
-  return value <= 33;
-}
-
-void ShouldActivateActuator(){
-  if(tempA == 0 || moistS == 0 || tempS == 0) {
+void manageWaterPump() {
+  if(moistS == 0) {
     return;
-  }
-  if(tempA > 33) {
-    controlFan(1);
   }
   if(moistS <= 20) {
     controlWaterPump(1);
+  }
+  if(moistS >= 60) {
+    controlWaterPump(0);
+  }
+}
+
+void manageFan(){
+  if(tempA == 0){
+    return;
+  }
+  if(tempA >= 35) {
+    controlFan(1);
+  }
+  if(tempA <= 30) {
+    controlFan(0);
   }
 }
