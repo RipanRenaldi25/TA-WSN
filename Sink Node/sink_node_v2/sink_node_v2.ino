@@ -18,8 +18,8 @@
 #define MQTT_PASSWORD "SmartGreenhouse123"
 #define MQTT_PORT 8883
 #define CLIENT_ID "gh01"
-#define SSID "F media"
-#define PASSWORD "media123"
+#define SSID "R"
+#define PASSWORD "ripan123"
 #define NODE_ID 255
 
 #define TOPIC_TO_SUBSCRIBE "gh01/#"
@@ -63,10 +63,16 @@ long int lastMQTTAttempt = 0;
 unsigned long lastWaterPumpActivate = 0;
 unsigned long lastFanActivate = 0;
 unsigned long lastActuatorMessage = 0;
-boolean waterPumpState = 0;
-boolean fanState = 0;
-boolean lastFanState = 0;
-boolean lastWaterPumpState = 0;
+boolean waterPumpState = 1;
+boolean fanState = 1;
+boolean lastFanState = 1;
+boolean lastWaterPumpState = 1;
+boolean isManual = false;
+
+
+unsigned long lastStatusWaterPumpMQTTSent= 0;
+unsigned long lastStatusFanMQTTSent= 0;
+unsigned long lastManualActive = 0;
 
 void showMessage(int x, int y, const char* message);
 void connectWifi();
@@ -81,14 +87,15 @@ void mqttCallback(const char* topic, byte* payload, int length);
 void controlActuator(const char*topic, byte* payload);
 void controlWaterPump(boolean status);
 void controlFan(boolean status);
-void actuatorOffOnThreshold();
-boolean isMoistureThreshold();
-boolean isTemperatureThreshold();
-void ShouldActivateActuator();
+void sentStatusActuator(const char* topic);
+void manageWaterPump();
+void manageFan();
 
 void setup() {
   Serial.begin(9600);
   setupRelay();
+  lastWaterPumpActivate = millis();
+  lastFanActivate = millis();
 
   display.init();
   display.backlight();
@@ -114,24 +121,37 @@ void loop() {
     parseLoRaPacket(sizeof(payload));
   }
 
-  ShouldActivateActuator();
+  if(isManual) {
+    if(millis() - lastManualActive >= 15000) {
+      controlWaterPump(1);
+      controlFan(1);
+      sentStatusActuator("waterpump");
+      sentStatusActuator("fan");
+      isManual = false;
+    }
+  }else {
+    manageWaterPump();
+    manageFan();
+  }
+
   
-  if(fanState || waterPumpState) {
+
+  
+  if(!fanState || !waterPumpState) {
     if(millis() - lastActuatorMessage >= 1000) {
       lastActuatorMessage = millis();
       display.clear();
       display.setCursor(0, 0);
       display.print("Actuator ON");
       String actuatorType = "";
-      if(fanState) {
+      if(!fanState) {
         actuatorType += "Fan ";
       }
-      if(waterPumpState) {
+      if(!waterPumpState) {
         actuatorType += "Water ";
       }
       display.setCursor(0, 1);
       display.print((actuatorType + "ON").c_str());
-      actuatorOffOnThreshold();
     }
   } else if(!hasNewPacket) {
     lastDisplayMillis = currentMillis;
@@ -141,13 +161,13 @@ void loop() {
     display.print((String("Node Id: ") + NODE_ID).c_str());
   }
 
-  if(waterPumpState && (millis() - lastWaterPumpActivate >= 20000)) {
-    controlWaterPump(0);
+  if(!waterPumpState && !isManual && (millis() - lastWaterPumpActivate >= 20000)) {
+    controlWaterPump(1);
     sentStatusActuator("waterpump");
   }
 
-  if(fanState && (millis() - lastFanActivate >= 20000)) {
-    controlFan(0);
+  if(!fanState && !isManual && (millis() - lastFanActivate >= 20000)) {
+    controlFan(1);
     sentStatusActuator("fan");
   }
 }
@@ -156,8 +176,8 @@ void setupRelay() {
   pinMode(RELAY_PIN_1, OUTPUT);
   pinMode(RELAY_PIN_2, OUTPUT);
 
-  digitalWrite(RELAY_PIN_1, LOW);
-  digitalWrite(RELAY_PIN_2, LOW);
+  digitalWrite(RELAY_PIN_1, HIGH);
+  digitalWrite(RELAY_PIN_2, HIGH);
 
 }
 
@@ -186,13 +206,21 @@ void connectWifi() {
   WiFi.mode(WIFI_MODE_STA);
   showMessage(0, 0, "Connecting wifi...");
   WiFi.begin(SSID, PASSWORD);
+  byte counter = 1;
   while (WiFi.status() != WL_CONNECTED) {
     showMessage(0, 0, "Connecting wifi...");
+    showMessage(0, 1, (String("Attempt: ") + counter).c_str());
+    if(counter == 12) {
+      display.clear();
+      showMessage(0, 0, "Wifi Failed");
+    }
+    counter++;
     delay(5000);
   }
   wifiClientSecure.setInsecure();
-  showMessage(0, 0, "Connected To: ");
-  showMessage(0, 1, SSID);
+  display.clear();
+  showMessage(0, 0, "Wifi Connected");
+  showMessage(0, 1, (String("SSID: ") + SSID).c_str());
 }
 
 boolean connectMQTT() {
@@ -348,8 +376,14 @@ void mqttCallback(const char* topic, byte* payload, int length ) {
 
 void controlActuator(const char* topic, byte* payload) {
   String currentTopic = String(topic);
-  boolean status = *payload == '1' ? HIGH : LOW;
-  Serial.println(String("Actuator ") + status ? "ON" : "OFF");
+  boolean status = *payload == '1' ? LOW : HIGH;
+  Serial.println(String("Actuator ") + !status ? "ON" : "OFF");
+  if(status == HIGH) {
+    isManual = false;
+  }else {
+    isManual = true;
+  }
+  lastManualActive = millis();
   
   if(currentTopic.indexOf("waterpump") != -1) {
     controlWaterPump(status);
@@ -366,10 +400,11 @@ void controlWaterPump(boolean status) {
   digitalWrite(RELAY_PIN_1, status);
   waterPumpState = status;
   if(!status) {
-    showMessage(0, 1, "Waterpump OFF...");
+    lastWaterPumpActivate = millis();
+    showMessage(0, 1, "Waterpump ON");
   }else {
     lastWaterPumpActivate = millis();
-    showMessage(0, 1, "Waterpump ON...");
+    showMessage(0, 1, "Waterpump OFF");
   }
   
   lastWaterPumpState = waterPumpState;
@@ -383,10 +418,10 @@ void controlFan(boolean status) {
   digitalWrite(RELAY_PIN_2, status);
   fanState = status;
   if(!status) {
-    showMessage(0, 1, "Fan OFF...");
+    showMessage(0, 1, "Fan ON");
   }else {
     lastFanActivate = millis();
-    showMessage(0, 1, "Fan ON...");
+    showMessage(0, 1, "Fan OFF");
   }
   lastFanState = fanState;
 }
@@ -394,18 +429,18 @@ void controlFan(boolean status) {
 void sentStatusActuator(const char* topic) {
   if(String(topic).indexOf("waterpump") != -1) {
     String statusTopic = "gh01/node" + String(NODE_ID) + "/status/waterpump";
-    if(mqttClient.publish(statusTopic.c_str(), waterPumpState ? "ON" : "OFF")) {
+    if(mqttClient.publish(statusTopic.c_str(), !waterPumpState ? "ON" : "OFF")) {
       display.clear();
       showMessage(0, 0, "Status sent");
-      showMessage(0, 1, (String("State: ") + waterPumpState).c_str());
+      showMessage(0, 1, (String("State: ") + !waterPumpState).c_str());
     }
   }
   if(String(topic).indexOf("fan") != -1) {
     String statusTopic = "gh01/node" + String(NODE_ID) + "/status/fan";
-    if(mqttClient.publish(statusTopic.c_str(), fanState ? "ON" : "OFF")) {
+    if(mqttClient.publish(statusTopic.c_str(), !fanState ? "ON" : "OFF")) {
       display.clear();
       showMessage(0, 0, "Status sent");
-      showMessage(0, 1, (String("State: ") + fanState).c_str());
+      showMessage(0, 1, (String("State: ") + !fanState).c_str());
     }
   }
 }
@@ -414,11 +449,15 @@ void manageWaterPump() {
   if(moistS == 0) {
     return;
   }
-  if(moistS <= 20) {
-    controlWaterPump(1);
+  String statusTopic = "gh01/node" + String(NODE_ID) + "/status/waterpump";
+  if(waterPumpState && (millis() - lastStatusWaterPumpMQTTSent >= 5000)) {
+    sentStatusActuator(statusTopic.c_str());
+    lastStatusWaterPumpMQTTSent = millis();
   }
-  if(moistS >= 60) {
+  if(moistS <= 20) {
     controlWaterPump(0);
+  } else if(moistS >= 60) {
+    controlWaterPump(1);
   }
 }
 
@@ -426,10 +465,16 @@ void manageFan(){
   if(tempA == 0){
     return;
   }
-  if(tempA >= 35) {
-    controlFan(1);
+  String statusTopic = "gh01/node" + String(NODE_ID) + "/status/fan";
+
+  if(!fanState && (millis() - lastStatusFanMQTTSent >= 5000)) {
+    sentStatusActuator(statusTopic.c_str());
+    lastStatusFanMQTTSent = millis();
   }
-  if(tempA <= 30) {
+
+  if(tempA >= 35) {
     controlFan(0);
+  }else if(tempA <= 30) {
+    controlFan(1);
   }
 }
