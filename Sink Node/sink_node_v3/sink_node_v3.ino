@@ -5,10 +5,16 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Arduino_JSON.h>
+#include <SD.h>
+#include <SPI.h>
+#include <RTClib.h>
 
-#define SS 25
-#define DIO 26
-#define RST 27
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_SCK 18
+#define LORA_SS 25
+#define LORA_DIO 26
+#define LORA_RST 27
 
 #define MQTT_SERVER "ff2efa61874b4e338caf837fc41443b3.s1.eu.hivemq.cloud"
 #define MQTT_USERNAME "cobamqtt"
@@ -18,18 +24,30 @@
 // #define MQTT_PASSWORD "SmartGreenhouse123"
 #define MQTT_PORT 8883
 #define CLIENT_ID "gh01"
-#define SSID "F media"
-#define PASSWORD "media123"
+#define SSID "nap"
+#define PASSWORD "napir123"
 #define NODE_ID 255
 
 #define TOPIC_TO_SUBSCRIBE "gh01/#"
 
 #define RELAY_PIN_1 32
-#define RELAY_PIN_2 4
+#define RELAY_PIN_2 33
+
+// SD CARD
+#define SD_MISO 5
+#define SD_MOSI 13
+#define SD_SCK 14
+#define SD_CS 15
+
+SPIClass loraSPI(VSPI);
+SPIClass sdSPI(HSPI);
 
 LiquidCrystal_I2C display(0x27, 16, 2);
 WiFiClientSecure wifiClientSecure;
 PubSubClient mqttClient;
+File myFile;
+
+RTC_DS3231 rtc;
 
 struct PayloadData {
   int8_t nodeId;
@@ -49,7 +67,7 @@ struct PayloadData payload;
 
 unsigned long lastDisplayMillis = 0;
 int lcdPage = 0;
-bool hasNewPacket = false;
+boolean hasNewPacket = false;
 
 int8_t nodeId = 0;
 int16_t n = 0, p = 0, k = 0, ec = 0;
@@ -73,6 +91,18 @@ boolean isManual = false;
 unsigned long lastStatusWaterPumpMQTTSent= 0;
 unsigned long lastStatusFanMQTTSent= 0;
 unsigned long lastManualActive = 0;
+unsigned long lastSDCardSent = 0;
+// int syncInterval = 10 * 1000;
+int syncInterval = 1000;
+byte currentPage = 0;
+boolean isShowInfo = false;
+unsigned long lastShowPage = 0;
+unsigned long lastShowInfo = 0;
+int showInfoDuration = 2000;
+int durationEachPage = 1000;
+boolean isInternetConnected = false;
+TaskHandle_t mqttTaskHandle = NULL;
+boolean isReconnecting = false;
 
 void showMessage(int x, int y, const char* message);
 void connectWifi();
@@ -90,12 +120,32 @@ void controlFan(boolean status);
 void sentStatusActuator(const char* topic);
 void manageWaterPump();
 void manageFan();
+void setupSDCard();
+void setupRTC();
+void syncSDCard(int length);
+void saveToSDCard(PayloadData &data);
+void displayData();
+
+void mqttTask(void *pvParameters) {
+  Serial.print("MQTT RUN ON CORE: ");
+  Serial.println(xPortGetCoreID());
+  while(true){
+    if (!mqttClient.connected()) {
+      reconnectMQTT(); 
+    }else {
+      mqttClient.loop();
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
 
 void setup() {
   Serial.begin(9600);
   setupRelay();
+  setupRTC();
   lastWaterPumpActivate = millis();
   lastFanActivate = millis();
+
 
   display.init();
   display.backlight();
@@ -103,18 +153,20 @@ void setup() {
   delay(2000);
   display.clear();
   setupLoRa();
+  setupSDCard();
   connectWifi();
-  connectMQTT();
+  showMessage(0, 0, "Init MQTT");
+  // connectMQTT();
+  xTaskCreatePinnedToCore(mqttTask, "MQTT_TASK", 10000, NULL, 1, &mqttTaskHandle, 0);
+  if(mqttClient.connected()) {
+    Serial.println("Connected");
+  }
+
 }
 
 void loop() {
   currentMillis = millis();
-
-  mqttClient.loop();
-
-  if (!mqttClient.connected()) {
-      reconnectMQTT();
-  }
+  isInternetConnected = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
 
   if (hasNewPacket) {
     parseLoRaPacket(sizeof(payload));
@@ -132,9 +184,6 @@ void loop() {
     manageWaterPump();
     manageFan();
   }
-
-  
-
   
   if(!fanState || !waterPumpState) {
     if(millis() - lastActuatorMessage >= 1000) {
@@ -152,17 +201,25 @@ void loop() {
       display.setCursor(0, 1);
       display.print((actuatorType + "ON").c_str());
     }
-  } else if( !mqttClient.connected() ) {
-    String message = "MQTT Failed";
-    byte status = mqttClient.state();
-    message += String(status);
-    showMessage(0, 0, message.c_str());
-  } else if(!hasNewPacket) {
+  }else if(isShowInfo) {
+    displayData();
+    if(millis() - lastShowInfo >= showInfoDuration) {
+      isShowInfo = false;
+      if(!isInternetConnected){
+        showMessage(0, 0, "Data Saved");
+        showMessage(0, 1, "(Offline)");
+      }else {
+        showMessage(0, 0, "Data Saved");
+        showMessage(0, 1, "(Synced)");
+      }
+    }
+  } else {
     lastDisplayMillis = currentMillis;
     display.setCursor(0,0);
-    display.print("Menunggu paket...");
+    display.print("MENUNGGU PAKET");
     display.setCursor(0,1);
     display.print((String("Node Id: ") + NODE_ID).c_str());
+    display.print("        ");
   }
 
   if(!waterPumpState && !isManual && (millis() - lastWaterPumpActivate >= 20000)) {
@@ -186,8 +243,25 @@ void setupRelay() {
   delay(1000);
 }
 
+void setupRTC() {
+  showMessage(0, 0, "Init RTC");
+  if(!rtc.begin()) {
+    showMessage(0, 0, "RTC Failed");
+    while(1);
+  }
+  if(rtc.lostPower()) {
+    showMessage(0, 0, "RE-SET RTC");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  DateTime currentTime = rtc.now();
+  char formatTime[] = "YYYY-MM-DD hh:mm:ss";
+  Serial.println(currentTime.toString(formatTime));
+}
+
 void setupLoRa() {
-  LoRa.setPins(SS, RST, DIO);
+  loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setSPI(loraSPI);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO);
   if (!LoRa.begin(923E6)) {
     Serial.println("LoRa Failed");
     showMessage(0, 0, "Lora Failed");
@@ -197,6 +271,17 @@ void setupLoRa() {
   delay(1000);
   LoRa.onReceive(loraCallback);
   LoRa.receive();
+}
+
+void setupSDCard() {
+ sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+ showMessage(0, 0, "Init SD Card");
+ if(!SD.begin(SD_CS, sdSPI) ) {
+  display.clear();
+  showMessage(0, 0, "SD Failed");
+  while(1);
+ }
+ showMessage(0, 0, "SD Card Success");
 }
 
 void showMessage(int x, int y, const char* message) {
@@ -213,7 +298,7 @@ void connectWifi() {
   WiFi.begin(SSID, PASSWORD);
   byte counter = 1;
   while (WiFi.status() != WL_CONNECTED) {
-    showMessage(0, 0, "Connecting wifi...");
+    showMessage(0, 0, "Re Connecting wifi...");
     showMessage(0, 1, (String("Attempt: ") + counter).c_str());
     if(counter == 12) {
       display.clear();
@@ -229,42 +314,78 @@ void connectWifi() {
 }
 
 boolean connectMQTT() {
-  display.clear();
-  showMessage(0, 0, "Initialize mqtt...");
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setClient(wifiClientSecure);
   mqttClient.connect(CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
   mqttClient.setCallback(mqttCallback);
   initializeSubscribe();
-  display.clear();
-  showMessage(0, 0, "MQTT Connected");
   return mqttClient.connected();
 }
 
 void reconnectMQTT() {
   if (millis() - lastMQTTAttempt >= 5000) {
     lastMQTTAttempt = millis();
-    showMessage(0, 0, "Attempting MQTT...");
-    connectMQTT();
+    isReconnecting = true;
+    mqttClient.setSocketTimeout(1);
+    if(connectMQTT()) {
+      lastMQTTAttempt = 0;
+      isReconnecting = false;
+    }
+  }
+}
+
+void saveToSDCard(PayloadData &data) {
+  DateTime currentTime = rtc.now();
+  char formatTimeStamp[] =  "YYYY-MM-DD hh:mm:ss";
+  int adjustedHour = currentTime.hour() + 7; //WIB
+  File logFile = SD.open("/logFile.csv", FILE_APPEND);
+  if(logFile){
+    String adjustedTimeStamp = currentTime.toString(formatTimeStamp);
+    logFile.print(adjustedTimeStamp);
+    logFile.print(",");
+    logFile.print(data.nodeId);
+    logFile.print(",");
+    logFile.print(data.soilMoisture);
+    logFile.print(",");
+    logFile.print(data.soilTemperature / 10);
+    logFile.print(",");
+    logFile.print(data.conductivity);
+    logFile.print(",");
+    logFile.print(data.conductivity);
+    logFile.print(",");
+    logFile.print(data.soilPh);
+    logFile.print(",");
+    logFile.print(data.nitrogen);
+    logFile.print(",");
+    logFile.print(data.phosporus);
+    logFile.print(",");
+    logFile.print(data.kalium);
+    logFile.print(",");
+    logFile.print(data.airTemperature / 10);
+    logFile.print(",");
+    logFile.print(data.airHumidity);
+    logFile.print(",");
+    logFile.print(data.lightIntensity);
+    logFile.println();
+    logFile.close();    
+  }else {
+    showMessage(0, 0, "File Not Found");
   }
 }
 
 void initializeSubscribe() {
   display.clear();
 
-  if(!mqttClient.subscribe("gh01/node255/control/+")) {
-    showMessage(0, 0, "Subscribe Failed");
-    showMessage(0, 1, "Topic control");
+  if(!mqttClient.subscribe("gh01/node/255/control/+")) {
+    Serial.println("Subscribe Failed: Topic control");
     return;
   };
 
-  if(!mqttClient.subscribe("gh01/node255/get/+")){
-    showMessage(0, 0, "Subscribe Failed");
-    showMessage(0, 1, "Topic status");
+  if(!mqttClient.subscribe("gh01/node/255/get/+")){
+    Serial.println("Subscribe Failed: Topic status");
     return;
   }
-
-  showMessage(0,0,"Subscribed Topik");
+  Serial.println("Subscribed");
 }
 
 void parseLoRaPacket(int packetSize) {
@@ -277,78 +398,31 @@ void parseLoRaPacket(int packetSize) {
     LoRa.receive();
     return;
   }
-
-  display.clear();
-  showMessage(0, 0, "Packet detected");
-  showMessage(0, 1, (String("Size: ") + packetSize).c_str());
-  Serial.println(packetSize);
-
-  nodeId = payload.nodeId;
-  n      = payload.nitrogen;
-  p      = payload.phosporus;
-  k      = payload.kalium;
-  moistS = payload.soilMoisture / 10.0;
-  tempS  = payload.soilTemperature / 10.0;
-  ec     = payload.conductivity;
-  phS    = payload.soilPh / 10.0;
-  tempA  = payload.airTemperature / 10.0;
-  humA   = payload.airHumidity / 10.0;
-  lux    = payload.lightIntensity;
-
-  payloadToPublish["id"]  = nodeId;
-  payloadToPublish["n"]   = n;
-  payloadToPublish["p"]   = p;
-  payloadToPublish["k"]   = k;
-  payloadToPublish["sm"]  = moistS;
-  payloadToPublish["st"]  = tempS;
-  payloadToPublish["ec"]  = ec;
-  payloadToPublish["pH"]  = phS;
-  payloadToPublish["at"]  = tempA;
-  payloadToPublish["ah"]  = humA;
-  payloadToPublish["lux"] = lux;
-
-  display.clear();
-  display.setCursor(0, 0);
-  display.print("N:");
-  display.print(n);
-  display.setCursor(8, 0);
-  display.print("P:");
-  display.print(p);
-  display.setCursor(0, 1);
-  display.print("K:");
-  display.print(k);
-  display.setCursor(8, 1);
-  display.print("M:");
-  display.print(moistS, 1);
-  delay(2000);
-
-  display.clear();
-  display.setCursor(0, 0);
-  display.print("Ts:");
-  display.print(tempS, 1);
-  display.setCursor(8, 0);
-  display.print("pH:");
-  display.print(phS, 1);
-  display.setCursor(0, 1);
-  display.print("Ta:");
-  display.print(tempA, 1);
-  display.setCursor(8, 1);
-  display.print("Hu:");
-  display.print(humA, 1);
-  delay(2000);
-
-  String topic = "gh01/node_" + String(nodeId) + "/parameter";
-  if (mqttClient.publish(topic.c_str(), JSON.stringify(payloadToPublish).c_str())) {
+ 
+  isInternetConnected = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
+  if(!isInternetConnected) {
     display.clear();
-    showMessage(0, 0, "mqtt msg sent");
-  } else {
-    showMessage(0, 0, "mqtt msg failed");
+    showMessage(0, 0, "Saving Offline..");
+  }
+  isShowInfo = true;
+  lastShowInfo = millis();
+  hasNewPacket = false;
+  saveToSDCard(payload);
+  LoRa.receive();
+
+  if(!isInternetConnected){
+    return;
   }
 
-  delay(2000);
-  hasNewPacket = false;
-  display.clear();
-  LoRa.receive();
+  if(WiFi.status() != WL_CONNECTED || !mqttClient.connected()) {
+    display.clear();
+    return;
+  }
+  if(millis() - lastSDCardSent  >= syncInterval) {
+    syncSDCard(10);
+  }else {
+    syncSDCard(1);
+  }
 }
 
 void loraCallback(int packetSize) {
@@ -425,7 +499,7 @@ void controlFan(boolean status) {
 
 void sentStatusActuator(const char* topic) {
   if(String(topic).indexOf("waterpump") != -1) {
-    String statusTopic = "gh01/node" + String(NODE_ID) + "/status/waterpump";
+    String statusTopic = "gh01/node/" + String(NODE_ID) + "/status/waterpump";
     if(mqttClient.publish(statusTopic.c_str(), !waterPumpState ? "ON" : "OFF")) {
       display.clear();
       showMessage(0, 0, "Status sent");
@@ -433,7 +507,7 @@ void sentStatusActuator(const char* topic) {
     }
   }
   if(String(topic).indexOf("fan") != -1) {
-    String statusTopic = "gh01/node" + String(NODE_ID) + "/status/fan";
+    String statusTopic = "gh01/node/" + String(NODE_ID) + "/status/fan";
     if(mqttClient.publish(statusTopic.c_str(), !fanState ? "ON" : "OFF")) {
       display.clear();
       showMessage(0, 0, "Status sent");
@@ -473,5 +547,99 @@ void manageFan(){
     controlFan(0);
   }else if(tempA <= 30) {
     controlFan(1);
+  }
+}
+
+void syncSDCard(int length) {
+  int position = 0;
+  File positionFile = SD.open("/position.txt", FILE_READ);
+  if(positionFile) {
+    position = positionFile.parseInt();
+    positionFile.close();
+  }
+
+  
+  File logFile = SD.open("/logFile.csv", FILE_READ); 
+  if(!logFile) {
+    return;
+  }
+
+  if((unsigned long) logFile.size() <= (unsigned long) position) {
+    showMessage(0, 0, "Already Sync...");
+    return;
+  }
+
+  logFile.seek(position);
+  String topic = "gh01/node/" + String(NODE_ID) + "/parameter";
+  int index = 0;
+  int lastPos = 0;
+  while(logFile.available() && index < length) {
+    String currentRow = logFile.readStringUntil('\n');
+    boolean isSuccess = mqttClient.publish(topic.c_str(), currentRow.c_str());
+    if(isSuccess) {
+      index++;
+      lastPos = logFile.position();
+    }else {
+      break;
+    }
+  }
+  logFile.close();
+  SD.remove("/position.txt");
+  File positionFileWriter = SD.open("/position.txt", FILE_WRITE);
+  if(positionFileWriter) {
+    positionFileWriter.print(lastPos);
+    positionFileWriter.close();
+  }
+  
+  lastSDCardSent = millis();
+}
+
+byte lastPage = -1;
+void displayData() {
+  if (millis() - lastShowPage >= durationEachPage) {
+    currentPage = (currentPage + 1) % 2;
+    lastShowPage = millis();
+    display.clear();
+  }
+
+  if(currentPage != lastPage) {
+    lastPage = currentPage;
+    return;
+  }
+
+  if (currentPage == 0) {
+    display.setCursor(0, 0);
+    display.print("N: ");
+    display.print(payload.nitrogen);
+    display.print("   ");
+    display.setCursor(8, 0);
+    display.print("P: ");
+    display.print(payload.phosporus);
+    display.print("   ");
+    display.setCursor(0, 1);
+    display.print("K: ");
+    display.print(payload.kalium);
+    display.print("   ");
+    display.setCursor(8, 1);
+    display.print("M: ");
+    display.print(payload.soilMoisture);
+    display.print("   ");
+  } else if (currentPage == 1) {
+    display.setCursor(0, 0);
+    display.print("Ts: ");
+    display.print(payload.soilTemperature / 10);
+    display.print("  ");
+    display.setCursor(8, 0);
+    display.print("pH: ");
+    display.print(payload.soilPh, 1);
+    display.print("  ");
+    display.setCursor(0, 1);
+    display.print("Ta: ");
+    display.print(payload.airTemperature / 10);
+    display.print("  ");
+    display.setCursor(8, 1);
+    display.print("Hu: ");
+    display.print(payload.airHumidity);
+    display.print("  ");
   }
 }

@@ -199,6 +199,15 @@ void requestData() {
   nitrogen = (int)((result[11] << 8) | result[12]);
   phosporus = (int)((result[13] << 8) | result[14]);
   kalium = (int)((result[15] << 8) | result[16]);
+  if(nitrogen == 0) {
+    nitrogen = 1;
+  }
+  if(phosporus == 0) {
+    phosporus  = 1;
+  }
+  if(kalium == 0) {
+    kalium = 1;
+  }
 }
 
 void clearScreen() {
