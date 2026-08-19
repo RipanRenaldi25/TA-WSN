@@ -1,4 +1,4 @@
-# 🌿 Dokumentasi Komprehensif Sistem Smart Greenhouse IoT (End-to-End)
+# Dokumentasi  Sistem Smart Greenhouse IoT
 
 Sistem *Smart Greenhouse* ini adalah solusi *Internet of Things* (IoT) terintegrasi penuh yang dirancang untuk memantau parameter pertanian dan mengotomatisasi sistem penyiraman (irigasi) tanaman. 
 
